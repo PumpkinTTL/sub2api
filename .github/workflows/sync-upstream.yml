@@ -1,0 +1,85 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force release even without upstream changes'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      new_tag: ${{ steps.bump.outputs.new_tag }}
+      has_changes: ${{ steps.check.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/Wei-Shaw/sub2api.git
+
+      - name: Fetch all
+        run: git fetch --all --tags --force
+
+      - name: Check for upstream changes
+        id: check
+        run: |
+          git checkout main
+          BEHIND=$(git rev-list --count HEAD..upstream/main 2>/dev/null || echo "0")
+          FORCE="${{ github.event.inputs.force == 'true' && 'true' || 'false' }}"
+          echo "Behind upstream by $BEHIND commits, force=$FORCE"
+          if [ "$BEHIND" -gt 0 ] || [ "$FORCE" = "true" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Sync main branch
+        if: steps.check.outputs.has_changes == 'true'
+        run: |
+          git checkout main
+          git reset --hard upstream/main
+          git push origin main --force
+
+      - name: Sync custom branch
+        if: steps.check.outputs.has_changes == 'true'
+        run: |
+          git checkout custom
+          if ! git merge main --no-edit --allow-unrelated-histories 2>&1; then
+            git checkout --ours -- backend/internal/service/update_service.go
+            git add -A
+            git commit --no-edit
+          fi
+
+      - name: Bump version
+        if: steps.check.outputs.has_changes == 'true'
+        id: bump
+        run: |
+          CURRENT=$(cat backend/cmd/server/VERSION 2>/dev/null || echo "0.0.0")
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          PATCH=${PATCH%%[^0-9]*}
+          PATCH=$((PATCH + 1))
+          NEW="${MAJOR}.${MINOR}.${PATCH}"
+          echo "$NEW" > backend/cmd/server/VERSION
+          echo "new_version=$NEW" >> $GITHUB_OUTPUT
+
+      - name: Commit and push tag
+        if: steps.check.outputs.has_changes == 'true'
+        run: |
+          VERSION="${{ steps.bump.outputs.new_version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/cmd/server/VERSION
+          git commit -m "chore: bump to v${VERSION} [skip ci]"
+          git tag "v${VERSION}"
+          git push origin custom
+          git push origin "v${VERSION}"
